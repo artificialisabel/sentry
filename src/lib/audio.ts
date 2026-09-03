@@ -87,7 +87,7 @@ class AudioEngine {
     try {
       el.currentTime = 0;
       el.volume = SFX_VOL[name];
-      void el.play();
+      void el.play().catch(() => {});
     } catch {/* ignore rapid-fire play interrupts */}
   }
 

@@ -8,6 +8,7 @@ interface Props {
   sbdbLoading: boolean;
   scrubberMs: number;
   onClose: () => void;
+  modal?: boolean;
 }
 
 // Plain-language note for each NEO orbit class returned by JPL SBDB.
@@ -35,7 +36,7 @@ function Row({ label, value, color }: {label: string;value: string;color?: strin
 
 }
 
-export function DetailPanel({ obj, sbdb, sbdbLoading, scrubberMs, onClose }: Props) {
+export function DetailPanel({ obj, sbdb, sbdbLoading, scrubberMs, onClose, modal = false }: Props) {
   const delta = obj.epochMs - scrubberMs;
   const ttp = (delta >= 0 ? "T− " : "T+ ") + fmtDuration(Math.abs(delta));
   const km = obj.distLd * 384400;
@@ -50,7 +51,11 @@ export function DetailPanel({ obj, sbdb, sbdbLoading, scrubberMs, onClose }: Pro
   const orbitYrs = sbdb && sbdb.ok && sbdb.per != null ? (sbdb.per / 365.25).toFixed(2) : null;
 
   return (
-    <div className="panel-frame w-[286px] max-w-[82vw] p-3 text-[var(--amber)] shadow-[0_0_24px_rgba(0,0,0,0.7)]">
+    <div className={`panel-frame overflow-y-auto overscroll-contain p-3 text-[var(--amber)] shadow-[0_0_24px_rgba(0,0,0,0.7)] ${
+      modal
+        ? "max-h-[calc(100dvh-32px)] w-[min(360px,calc(100vw-20px))]"
+        : "max-h-[min(430px,calc(100dvh-250px))] w-[286px] max-w-[82vw] md:max-h-[min(520px,calc(100dvh-120px))]"
+    }`}>
       <div className="mb-2 flex items-start justify-between pb-1">
         <div className="min-w-0">
           <div className="text-[11px] tracking-widest text-[var(--orange)]">ASTEROID</div>

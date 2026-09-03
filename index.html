@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>SENTRY: Near Earth Object Encounters</title>
+  <link rel="icon" type="image/png" href="/sentry_favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
@@ -35,37 +36,33 @@
     -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision;
   }
   #root { height: 100vh; height: 100dvh; }
-  /* Mobile-first console layout: main map on top, mini-radar column + data feed,
-     then the NASA DONKI space-weather panels stacked below. The grid scrolls on
-     small screens so every panel keeps a usable height. */
+  /* Mobile-first console layout: main map on top, two inactive-view miniatures
+     beside the data feed. The grid scrolls on small screens so every panel keeps
+     a usable height. */
   .console-grid {
     display: grid; min-height: 0; overflow-y: auto;
-    grid-template-columns: 1fr 1fr;
-    grid-template-rows: 56vh minmax(150px,1fr) minmax(150px,1fr) minmax(150px,40vh) minmax(150px,32vh) minmax(150px,40vh);
-    grid-template-areas:
-      "main main"
-      "mini feed"
-      "radar feed"
-      "sw-cme sw-cme"
-      "sw-flare sw-flare"
-      "sw-kp sw-kp";
+    --panel-left: 300px;
+    --panel-mini: 190px;
+    --panel-radar: 210px;
+    --panel-feed: minmax(132px, 1fr);
+    --mobile-main: 60%;
+    --mobile-left: 50%;
+    --mobile-mini: minmax(96px, 1fr);
+    --mobile-radar: minmax(96px, 1fr);
+    grid-template-columns: minmax(118px, var(--mobile-left)) minmax(0, 1fr);
+    grid-template-rows: var(--mobile-main) var(--mobile-mini) var(--mobile-radar);
+    grid-template-areas: "main main" "mini feed" "radar feed";
   }
   .area-main { grid-area: main; }
   .area-mini { grid-area: mini; }
   .area-radar { grid-area: radar; }
   .area-feed { grid-area: feed; }
-  .area-sw-cme { grid-area: sw-cme; }
-  .area-sw-flare { grid-area: sw-flare; }
-  .area-sw-kp { grid-area: sw-kp; }
   @media (min-width: 768px) {
     .console-grid {
       overflow: hidden;
-      grid-template-columns: clamp(210px, 21vw, 320px) 1fr clamp(220px, 23vw, 360px);
-      grid-template-rows: minmax(150px, 26%) minmax(150px, 28%) 1fr;
-      grid-template-areas:
-        "mini  main sw-cme"
-        "radar main sw-flare"
-        "feed  main sw-kp";
+      grid-template-columns: var(--panel-left) minmax(0, 1fr);
+      grid-template-rows: var(--panel-mini) var(--panel-radar) var(--panel-feed);
+      grid-template-areas: "mini main" "radar main" "feed main";
     }
   }
   .font-display { font-family: var(--font-display); }
@@ -82,8 +79,24 @@
   .title-tag { display: inline-flex; align-items: center; gap: 6px; border: 1.5px solid var(--amber-dim);
       border-radius: 5px; padding: 2px 9px; font-weight: 700; font-size: 12px; line-height: 1.1;
       color: var(--amber); text-shadow: 0 0 6px currentColor; background: rgba(5,4,10,0.7); white-space: nowrap; }
+  .collapse-marker { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px;
+      border: 0; border-radius: 0; color: var(--amber-bright); background: transparent;
+      font-size: 13px; line-height: 1; text-shadow: 0 0 6px currentColor; cursor: pointer; }
+  .collapse-marker:hover { color: var(--amber); }
   .panel-frame { border: 1.5px solid var(--amber-dim); border-radius: 8px; background:
       radial-gradient(120% 140% at 0% 0%, rgba(240,179,42,0.05), transparent 55%), var(--panel); }
+  .resize-handle { position: relative; z-index: 45; pointer-events: auto; touch-action: none; }
+  .resize-handle-v { width: 1.5px; height: 100%; cursor: col-resize; transform: translateX(50%); }
+  .resize-handle-h { width: 100%; height: 1.5px; cursor: row-resize; transform: translateY(50%); }
+  .resize-handle::before { content: ""; position: absolute; background: var(--amber-dim);
+      box-shadow: 0 0 8px rgba(242,101,0,0.68); opacity: 0.64; transition: opacity 120ms ease, background 120ms ease; }
+  .resize-handle-v::before { top: 0; bottom: 0; left: 0; width: 100%; }
+  .resize-handle-h::before { left: 0; right: 0; top: 0; height: 100%; }
+  .resize-handle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 8px; height: 8px;
+      border: 1.5px solid var(--amber-bright); background: var(--bg); transform: translate(-50%, -50%) rotate(45deg);
+      box-shadow: 0 0 7px var(--amber); opacity: 0.9; }
+  .resize-handle:hover::before, .resizing-panels .resize-handle::before { opacity: 1; background: var(--amber); }
+  .resizing-panels, .resizing-panels * { cursor: inherit; user-select: none; }
   .scan { position: fixed; inset: 0; pointer-events: none; z-index: 50;
     background: repeating-linear-gradient(0deg, rgba(0,0,0,0.0) 0px, rgba(0,0,0,0.0) 2px, rgba(0,0,0,0.16) 3px, rgba(0,0,0,0.16) 4px);
     mix-blend-mode: multiply; opacity: 0.7; }

@@ -1,5 +1,5 @@
 import React, { useRef } from "react";
-import type { CadResponse, NeoObject, SatElements } from "../lib/types";
+import type { CadResponse, NeoObject, SatElements, SpacecraftResponse } from "../lib/types";
 import { fmtDateShort } from "../lib/format";
 
 interface Props {
@@ -8,6 +8,8 @@ interface Props {
   onSelect: (o: NeoObject) => void;
   selectedId: string | null;
   sats: SatElements[];
+  spacecraft?: SpacecraftResponse | null;
+  selectedCraftId?: string | null;
 }
 
 const EARTH_R_KM = 6371.0;
@@ -20,9 +22,10 @@ const SAT_GROUP: Record<string, {abbr: string;color: string;}> = {
   other: { abbr: "OTH", color: "#8a93b5" }
 };
 
-export function DataFeed({ data, events, onSelect, selectedId, sats }: Props) {
+export function DataFeed({ data, events, onSelect, selectedId, sats, spacecraft, selectedCraftId }: Props) {
   // Feed stays anchored at the top so the uplink header reads first.
   const listRef = useRef<HTMLDivElement | null>(null);
+  const selectedCraft = spacecraft?.vehicles.find((v) => v.id === selectedCraftId) ?? spacecraft?.vehicles[0] ?? null;
 
   return (
     <div className="flex h-full flex-col overflow-hidden text-[12px] leading-tight">
@@ -42,6 +45,33 @@ export function DataFeed({ data, events, onSelect, selectedId, sats }: Props) {
         {events.map((e, i) =>
         <div key={i} className="text-[var(--green)] opacity-90">{e}</div>
         )}
+
+        {selectedCraft &&
+        <div className="mt-2 pt-1">
+            <div className="text-[var(--orange)]">SPACECRAFT PUBLIC DATA · {selectedCraft.shortName}</div>
+            <div className="text-[var(--green)]">SRC {spacecraft?.source ?? "NASA/JPL PUBLIC DATA"}</div>
+            {selectedCraft.dataSources.map((s) => (
+              <a
+                key={s.label}
+                href={s.endpoint}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block truncate text-[var(--green)] opacity-90 hover:text-[var(--amber-bright)]">
+                {s.label.toUpperCase().padEnd(16, " ")} {s.source}
+              </a>
+            ))}
+            {selectedCraft.assets.slice(0, 3).map((a) => (
+              <a
+                key={a.nasaId || a.href}
+                href={a.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block truncate text-[var(--cyan)] opacity-90 hover:text-[var(--amber-bright)]">
+                NASA IMAGE {a.nasaId || "ASSET"} · {a.title}
+              </a>
+            ))}
+          </div>
+        }
 
         {/* object stream */}
         {data &&

@@ -166,6 +166,61 @@ export interface SpaceWeatherResponse {
   error?: string;
 }
 
+// ---- Deep-space spacecraft roster / public-data handles ------------------
+// Curated spacecraft facts plus NASA/JPL public endpoint references. Schematics
+// are rendered locally from the `schematic` token; optional image assets come
+// from NASA Image and Video Library search metadata.
+
+export type SpacecraftSchematic =
+  "voyager" | "new-horizons" | "parker" | "juno" | "cassini" | "galileo" | "pioneer" | "psyche";
+
+export interface SpacecraftImageAsset {
+  title: string;
+  nasaId: string;
+  href: string;
+  center: string;
+  dateCreated: string;
+}
+
+export interface SpacecraftPublicDataSource {
+  label: string;
+  source: string;
+  kind: "ephemeris" | "kernels" | "image-search" | "mission" | "archive";
+  endpoint: string;
+  note: string;
+}
+
+export interface SpacecraftVehicle {
+  id: string;
+  name: string;
+  shortName: string;
+  status: string;
+  launchDate: string;
+  primaryRegion: string;
+  rangeAu: number | null;
+  speedKms: number | null;
+  horizonsId: string;
+  spiceId: string;
+  missionUrl: string;
+  modelUrl: string | null;
+  modelSourceUrl: string;
+  schematic: SpacecraftSchematic;
+  signal: string;
+  dataSources: SpacecraftPublicDataSource[];
+  assets: SpacecraftImageAsset[];
+}
+
+export interface SpacecraftResponse {
+  ok: boolean;
+  source: string;
+  vehicles: SpacecraftVehicle[];
+  requests: ApiRequestLog[];
+  computedAt?: number;
+  cached?: boolean;
+  cachedAt?: number;
+  error?: string;
+}
+
 export interface SbdbResponse {
   ok: boolean;
   fullname: string;

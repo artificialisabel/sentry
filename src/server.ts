@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseCD } from "./lib/format";
 import { AU_TO_LD, MU_EARTH, satEclipticKm } from "./lib/astro";
-import type { CadResponse, CmeEvent, ElementsResponse, FlareClass, FlareEvent, GeoStormEvent, KpSample, NeoObject, OrbitElements, SatElements, SatResponse, SbdbResponse, SentryInfo, SpaceWeatherResponse } from "./lib/types";
+import type { CadResponse, CmeEvent, ElementsResponse, FlareClass, FlareEvent, GeoStormEvent, KpSample, NeoObject, OrbitElements, SatElements, SatResponse, SbdbResponse, SentryInfo, SpaceWeatherResponse, SpacecraftImageAsset, SpacecraftResponse, SpacecraftVehicle } from "./lib/types";
 
 type StoredSnapshotFile = { snapshots: Array<{ payload: SatResponse; savedAt: number }> };
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,8 +33,6 @@ async function readSnapshotResponse(): Promise<{ snapshot: StoredSnap | null }> 
   return { snapshot: file.snapshots[0] ?? null };
 }
 
-
-
 const JPL_HEADERS = {
   "user-agent": "near-earth-encounter-scope/1.0 (educational orbital visualiser)",
   accept: "application/json",
@@ -43,10 +41,7 @@ const JPL_HEADERS = {
 // Small in-isolate cache to be a courteous API consumer (JPL/NASA guidelines
 // ask clients to avoid hammering the public endpoints).
 const cache = new Map<string, { t: number; body: any }>();
-// Only these fixed public science endpoints may ever be contacted. The app
-// never fetches a viewer-supplied URL — callers build URLs from one of these
-// hosts plus app-specific query parameters.
-// The two fixed public science origins this app is allowed to contact. The
+// Fixed public science origins this app is allowed to contact. The
 // origin is ALWAYS a literal here; callers may only choose a known endpoint
 // path and supply app-specific query parameters (date windows, object
 // designations, catalogue group). No viewer-supplied URL ever reaches fetch.
@@ -59,10 +54,22 @@ const API_ORIGINS = {
   // of the box thanks to the multi-hour cache below; set NASA_API_KEY to use a
   // personal key (free, instant at https://api.nasa.gov) for higher limits.
   donki: "https://api.nasa.gov",
+  images: "https://images-api.nasa.gov",
 } as const;
 
+// Fixed NASA-hosted binary glTF models. The ID-based route below redirects only
+// to these literals, so no viewer-supplied URL ever reaches fetch.
+const NASA_3D_MODEL_URLS: Record<string, string> = {
+  voyager: "https://assets.science.nasa.gov/content/dam/science/psd/solar/2023/09/v/Voyager.glb?emrc=6a489f4a9dc51",
+  "new-horizons": "https://assets.science.nasa.gov/content/dam/science/psd/solar/2023/09/n/New_Horizons.glb?emrc=6a48a68ebacea",
+  parker: "https://assets.science.nasa.gov/content/dam/science/psd/solar/2023/09/p/s/PSP.glb?emrc=6a48a68ec9254",
+  juno: "https://assets.science.nasa.gov/content/dam/science/psd/solar/2023/09/j/Juno.glb?emrc=6a48a69040c14",
+  cassini: "https://assets.science.nasa.gov/content/dam/science/psd/solar/2023/09/c/Cassini.glb?emrc=6a488df9c1f6e",
+  galileo: "https://assets.science.nasa.gov/content/dam/science/cds/3d/resources/model/galileo/Galileo.glb?emrc=6a48a6ab05896",
+};
+
 // NASA api.nasa.gov key. DEMO_KEY is rate-limited (30/hr, 50/day per IP) but
-// our 6h server-side cache means at most a handful of calls per day.
+// our 3h server-side cache keeps the request rate modest.
 const NASA_API_KEY = process.env.NASA_API_KEY ?? "DEMO_KEY";
 type ApiHost = keyof typeof API_ORIGINS;
 
@@ -84,8 +91,10 @@ async function fetchJSON(
     res = await fetch(new URL(`${u.pathname}${u.search}`, "https://ssd-api.jpl.nasa.gov"), { headers: JPL_HEADERS });
   } else if (host === "donki") {
     res = await fetch(new URL(`${u.pathname}${u.search}`, "https://api.nasa.gov"), { headers: JPL_HEADERS });
-  } else {
+  } else if (host === "celestrak") {
     res = await fetch(new URL(`${u.pathname}${u.search}`, "https://celestrak.org"), { headers: JPL_HEADERS });
+  } else {
+    res = await fetch(new URL(`${u.pathname}${u.search}`, "https://images-api.nasa.gov"), { headers: JPL_HEADERS });
   }
   const body = await res.json().catch(() => null);
   if (res.ok && body) cache.set(key, { t: Date.now(), body });
@@ -694,6 +703,310 @@ async function handleSpaceWeather(): Promise<Response> {
   }
 }
 
+// ---- NASA/JPL spacecraft public-data roster ------------------------------
+// There is no single NASA endpoint that returns "all probes + schematics".
+// This endpoint exposes a curated roster with the public data handles an
+// operator can actually use: JPL Horizons for ephemerides, NAIF/SPICE kernels
+// for precision trajectories, NASA Images search for visual/reference assets,
+// and mission/archive pages for context.
+const SPACECRAFT_TTL_MS = 24 * 60 * 60 * 1000; // one day
+let lastGoodSpacecraft: SpacecraftResponse | null = null;
+
+const horizonsEndpoint = (command: string, startDate?: string, stopDate?: string) => {
+  const now = Date.now();
+  const start = startDate ?? ymd(new Date(now));
+  const stop = stopDate ?? ymd(new Date(now + 86400000));
+  return `https://ssd.jpl.nasa.gov/api/horizons.api?format=json&COMMAND='${command}'&EPHEM_TYPE=VECTORS&CENTER='500@0'&START_TIME='${start}'&STOP_TIME='${stop}'&STEP_SIZE='1d'`;
+};
+
+const imagesEndpoint = (q: string) =>
+  `https://images-api.nasa.gov/search?media_type=image&q=${encodeURIComponent(q)}`;
+
+const spiceEndpoint = (path: string) =>
+  `https://naif.jpl.nasa.gov/pub/naif/${path}`;
+
+const modelSourceEndpoint = (q: string) =>
+  `https://science.nasa.gov/3d-resources/?search=${encodeURIComponent(q)}`;
+
+const modelProxyEndpoint = (id: string) =>
+  `/app-api/spacecraft-model?id=${encodeURIComponent(id)}`;
+
+function sourceSet(
+  vehicle: string,
+  command: string,
+  spicePath: string,
+  missionUrl: string,
+  vectorWindow?: readonly [startDate: string, stopDate: string],
+): SpacecraftVehicle["dataSources"] {
+  const imageQuery = `${vehicle} spacecraft diagram`;
+  return [
+    {
+      label: "STATE VECTOR",
+      source: "JPL Horizons",
+      kind: "ephemeris",
+      endpoint: horizonsEndpoint(command, vectorWindow?.[0], vectorWindow?.[1]),
+      note: "Time-tagged spacecraft position and velocity vectors relative to the solar-system barycenter.",
+    },
+    {
+      label: "TRAJECTORY KERNELS",
+      source: "NAIF/SPICE",
+      kind: "kernels",
+      endpoint: spiceEndpoint(spicePath),
+      note: "Precision spacecraft kernels and mission geometry products for SPICE-capable tooling.",
+    },
+    {
+      label: "VISUAL ASSETS",
+      source: "NASA Image and Video Library",
+      kind: "image-search",
+      endpoint: imagesEndpoint(imageQuery),
+      note: "Public media metadata; useful for photos, diagrams, renders, and caption provenance.",
+    },
+    {
+      label: "MISSION RECORD",
+      source: "NASA/JPL mission pages",
+      kind: "mission",
+      endpoint: missionUrl,
+      note: "Mission overview, instrument notes, status, and public science archive links.",
+    },
+  ];
+}
+
+function spacecraftBase(): Omit<SpacecraftVehicle, "assets">[] {
+  return [
+  {
+    id: "voyager-1",
+    name: "Voyager 1",
+    shortName: "VGR-1",
+    status: "INTERSTELLAR · ACTIVE",
+    launchDate: "1977-09-05",
+    primaryRegion: "HELIOSHEATH / INTERSTELLAR",
+    rangeAu: 166,
+    speedKms: 17,
+    horizonsId: "-31",
+    spiceId: "-31",
+    missionUrl: "https://science.nasa.gov/mission/voyager/",
+    modelUrl: modelProxyEndpoint("voyager"),
+    modelSourceUrl: "https://science.nasa.gov/resource/voyager-3d-model/",
+    schematic: "voyager",
+    signal: "70M DSN · X-BAND",
+    dataSources: sourceSet("Voyager 1", "-31", "VOYAGER/kernels/", "https://science.nasa.gov/mission/voyager/"),
+  },
+  {
+    id: "voyager-2",
+    name: "Voyager 2",
+    shortName: "VGR-2",
+    status: "INTERSTELLAR · ACTIVE",
+    launchDate: "1977-08-20",
+    primaryRegion: "HELIOSHEATH / INTERSTELLAR",
+    rangeAu: 139,
+    speedKms: 15,
+    horizonsId: "-32",
+    spiceId: "-32",
+    missionUrl: "https://science.nasa.gov/mission/voyager/",
+    modelUrl: modelProxyEndpoint("voyager"),
+    modelSourceUrl: "https://science.nasa.gov/resource/voyager-3d-model/",
+    schematic: "voyager",
+    signal: "70M DSN · S/X-BAND",
+    dataSources: sourceSet("Voyager 2", "-32", "VOYAGER/kernels/", "https://science.nasa.gov/mission/voyager/"),
+  },
+  {
+    id: "new-horizons",
+    name: "New Horizons",
+    shortName: "NH",
+    status: "KUIPER BELT · ACTIVE",
+    launchDate: "2006-01-19",
+    primaryRegion: "OUTER SOLAR SYSTEM",
+    rangeAu: 63,
+    speedKms: 14,
+    horizonsId: "-98",
+    spiceId: "-98",
+    missionUrl: "https://science.nasa.gov/mission/new-horizons/",
+    modelUrl: modelProxyEndpoint("new-horizons"),
+    modelSourceUrl: "https://science.nasa.gov/resource/new-horizons-3d-model/",
+    schematic: "new-horizons",
+    signal: "DSN · X-BAND",
+    dataSources: sourceSet("New Horizons", "-98", "NEWHORIZONS/kernels/", "https://science.nasa.gov/mission/new-horizons/"),
+  },
+  {
+    id: "parker-solar-probe",
+    name: "Parker Solar Probe",
+    shortName: "PSP",
+    status: "SOLAR CORONA · ACTIVE",
+    launchDate: "2018-08-12",
+    primaryRegion: "INNER HELIOSPHERE",
+    rangeAu: 0.25,
+    speedKms: 190,
+    horizonsId: "-96",
+    spiceId: "-96",
+    missionUrl: "https://science.nasa.gov/mission/parker-solar-probe/",
+    modelUrl: modelProxyEndpoint("parker"),
+    modelSourceUrl: "https://science.nasa.gov/resource/parker-solar-probe-3d-model/",
+    schematic: "parker",
+    signal: "DSN · HIGH-GAIN WHEN THERMALLY SAFE",
+    dataSources: sourceSet("Parker Solar Probe", "-96", "SPP/kernels/", "https://science.nasa.gov/mission/parker-solar-probe/"),
+  },
+  {
+    id: "juno",
+    name: "Juno",
+    shortName: "JUNO",
+    status: "JUPITER ORBIT · ACTIVE",
+    launchDate: "2011-08-05",
+    primaryRegion: "JOVIAN SYSTEM",
+    rangeAu: 5.2,
+    speedKms: null,
+    horizonsId: "-61",
+    spiceId: "-61",
+    missionUrl: "https://science.nasa.gov/mission/juno/",
+    modelUrl: modelProxyEndpoint("juno"),
+    modelSourceUrl: "https://science.nasa.gov/resource/juno-3d-model/",
+    schematic: "juno",
+    signal: "DSN · X/KA-BAND",
+    dataSources: sourceSet("Juno", "-61", "JUNO/kernels/", "https://science.nasa.gov/mission/juno/"),
+  },
+  {
+    id: "cassini",
+    name: "Cassini",
+    shortName: "CAS",
+    status: "SATURN · ENDED 2017",
+    launchDate: "1997-10-15",
+    primaryRegion: "SATURN SYSTEM",
+    rangeAu: 9.5,
+    speedKms: null,
+    horizonsId: "-82",
+    spiceId: "-82",
+    missionUrl: "https://science.nasa.gov/mission/cassini/",
+    modelUrl: modelProxyEndpoint("cassini"),
+    modelSourceUrl: "https://science.nasa.gov/resource/cassini-3d-model/",
+    schematic: "cassini",
+    signal: "ARCHIVE · DSN RECORDS",
+    dataSources: sourceSet("Cassini", "-82", "CASSINI/kernels/", "https://science.nasa.gov/mission/cassini/", ["2017-09-14", "2017-09-15"]),
+  },
+  {
+    id: "galileo",
+    name: "Galileo",
+    shortName: "GAL",
+    status: "JUPITER · ENDED 2003",
+    launchDate: "1989-10-18",
+    primaryRegion: "JOVIAN SYSTEM",
+    rangeAu: 5.2,
+    speedKms: null,
+    horizonsId: "-77",
+    spiceId: "-77",
+    missionUrl: "https://science.nasa.gov/mission/galileo/",
+    modelUrl: modelProxyEndpoint("galileo"),
+    modelSourceUrl: "https://science.nasa.gov/3d-resources/galileo/",
+    schematic: "galileo",
+    signal: "ARCHIVE · DSN RECORDS",
+    dataSources: sourceSet("Galileo spacecraft", "-77", "GLL/kernels/", "https://science.nasa.gov/mission/galileo/", ["2003-09-20", "2003-09-21"]),
+  },
+  {
+    id: "psyche",
+    name: "Psyche",
+    shortName: "PSY",
+    status: "ASTEROID TRANSFER · ACTIVE",
+    launchDate: "2023-10-13",
+    primaryRegion: "MAIN BELT TRANSFER",
+    rangeAu: 2.2,
+    speedKms: null,
+    horizonsId: "-255",
+    spiceId: "-255",
+    missionUrl: "https://science.nasa.gov/mission/psyche/",
+    modelUrl: null,
+    modelSourceUrl: modelSourceEndpoint("Psyche spacecraft"),
+    schematic: "psyche",
+    signal: "DSN · X-BAND / DSOC DEMO",
+    dataSources: sourceSet("Psyche spacecraft", "-255", "PSYCHE/kernels/", "https://science.nasa.gov/mission/psyche/"),
+  },
+  ];
+}
+
+function normalizeImageAssets(items: any[]): SpacecraftImageAsset[] {
+  return items.slice(0, 4).map((item) => {
+    const meta = Array.isArray(item?.data) ? item.data[0] ?? {} : {};
+    return {
+      title: String(meta?.title ?? "NASA image asset").slice(0, 120),
+      nasaId: String(meta?.nasa_id ?? ""),
+      href: String(item?.href ?? ""),
+      center: String(meta?.center ?? "NASA"),
+      dateCreated: String(meta?.date_created ?? ""),
+    };
+  }).filter((a) => a.nasaId || a.href);
+}
+
+async function handleSpacecraft(): Promise<Response> {
+  let requests: SpacecraftResponse["requests"] = [];
+  try {
+    // Fetch image-library enrichment concurrently so a cold serverless start is
+    // bounded by one upstream round trip rather than eight sequential ones.
+    const resolved = await Promise.all(spacecraftBase().map(async (craft) => {
+      const query = `${craft.name} spacecraft diagram`;
+      const url = imagesEndpoint(query);
+      let assets: SpacecraftImageAsset[] = [];
+      let request: SpacecraftResponse["requests"][number];
+      try {
+        const r = await fetchJSON("images", "/search", { media_type: "image", q: query }, SPACECRAFT_TTL_MS);
+        const items: any[] = Array.isArray(r.body?.collection?.items) ? r.body.collection.items : [];
+        request = { label: `NASA Images ${craft.shortName}`, url, status: r.status, count: items.length };
+        assets = normalizeImageAssets(items);
+      } catch {
+        request = { label: `NASA Images ${craft.shortName}`, url, status: 0, count: 0 };
+      }
+      return { vehicle: { ...craft, assets } satisfies SpacecraftVehicle, request };
+    }));
+    const vehicles = resolved.map(({ vehicle }) => vehicle);
+    requests = resolved.map(({ request }) => request);
+    const payload: SpacecraftResponse = {
+      ok: true,
+      source: "NASA Images · JPL Horizons · NAIF/SPICE · NASA mission archives",
+      vehicles,
+      requests,
+      computedAt: Date.now(),
+    };
+    lastGoodSpacecraft = payload;
+    return Response.json(payload, { headers: { "cache-control": "no-store" } });
+  } catch (err: any) {
+    if (lastGoodSpacecraft) {
+      return Response.json({
+        ...lastGoodSpacecraft,
+        cached: true,
+        cachedAt: lastGoodSpacecraft.computedAt ?? Date.now(),
+        requests: [...requests, ...lastGoodSpacecraft.requests],
+      } satisfies SpacecraftResponse, { headers: { "cache-control": "no-store" } });
+    }
+    return Response.json({ ok: false, source: "NASA/JPL spacecraft roster", vehicles: [], requests, error: String(err?.message ?? err) } satisfies SpacecraftResponse, { status: 502 });
+  }
+}
+
+function handleSpacecraftModel(id: string): Response {
+  if (!Object.prototype.hasOwnProperty.call(NASA_3D_MODEL_URLS, id)) {
+    return Response.json({ ok: false, error: "unknown spacecraft model" }, { status: 404 });
+  }
+  const modelUrl = NASA_3D_MODEL_URLS[id];
+  if (typeof modelUrl !== "string") return Response.json({ ok: false, error: "unknown spacecraft model" }, { status: 404 });
+  // Some official GLBs exceed Vercel Functions' response-size ceiling. NASA's
+  // asset host permits CORS, so redirect the fixed, allowlisted ID instead of
+  // buffering multi-megabyte binaries through the serverless function.
+  return new Response(null, {
+    status: 307,
+    headers: {
+      location: modelUrl,
+      "cache-control": "public, max-age=86400",
+    },
+  });
+}
+
+const PUBLIC_SFX: Record<string, string> = {
+  click: "/audio/sentry-2-bfqqdv-xbgsyz.mp3",
+  hover: "/audio/sentry-4-uvwqfs-fvdzwt.mp3",
+  confirm: "/audio/sentry-1-eufvte-wgsyex.mp3",
+  pause: "/audio/sentry-3-gtwscc-ctzxdq.mp3",
+  glitch: "/audio/sentry-5-bwetrr-dsdzrf.mp3",
+  select: "/audio/sentry-2-bfqqdv-xbgsyz.mp3",
+  close: "/audio/sentry-4-uvwqfs-fvdzwt.mp3",
+  saber: "/audio/sentry-1-eufvte-wgsyex.mp3",
+  ambient: "/audio/sentry-6-vtzbfq-zwzxeu.mp3",
+};
+
 export async function handleApi(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
@@ -706,14 +1019,17 @@ export async function handleApi(req: Request): Promise<Response> {
 
   if (url.pathname === "/app-api/cad") return handleCad();
   if (url.pathname === "/app-api/spaceweather") return handleSpaceWeather();
+  if (url.pathname === "/app-api/spacecraft") return handleSpacecraft();
+  if (url.pathname === "/app-api/spacecraft-model") return handleSpacecraftModel(url.searchParams.get("id") ?? "");
   if (url.pathname === "/app-api/sats") return handleSats();
   if (url.pathname === "/app-api/sfx") {
     return Response.json({
-      ok: false,
-      enabled: false,
-      reason: "LOCAL_AUDIO_MANIFEST_NOT_CONFIGURED",
-      sfx: {},
-    });
+      ok: true,
+      enabled: true,
+      source: "local public/audio",
+      files: 6,
+      sfx: PUBLIC_SFX,
+    }, { headers: { "cache-control": "public, max-age=86400" } });
   }
   if (url.pathname === "/app-api/sbdb") {
     const des = url.searchParams.get("des") ?? "";

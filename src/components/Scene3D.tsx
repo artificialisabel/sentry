@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
-import type { CmeEvent, FlareEvent, NeoObject, OrbitElements, SatElements } from "../lib/types";
+import type { CmeEvent, FlareEvent, NeoObject, OrbitElements, SatElements, SpacecraftVehicle } from "../lib/types";
 import {
   orbitPosition,
   orbitPath3D,
@@ -44,6 +44,8 @@ interface Props {
   cmes?: CmeEvent[];
   flares?: FlareEvent[];
   layers?: Partial<SceneLayers>;
+  spacecraft?: SpacecraftVehicle[];
+  onSelectCraft?: (craft: SpacecraftVehicle) => void;
 }
 
 const AMBER = 0xf0b32a;
@@ -67,6 +69,7 @@ const SAT_COLORS: Record<string, number> = {
 };
 
 const AU_SCALE = 46; // units per AU (heliocentric)
+const HELIO_LINEAR_AU = 4;
 const LD_SCALE = 3.3; // units per lunar distance (geocentric)
 const GEO_AU = AU_TO_LD * LD_SCALE; // units per AU in geocentric mode
 const GEO_KM = LD_SCALE / LUNAR_DISTANCE_KM; // units per km in geocentric mode
@@ -87,7 +90,6 @@ function cmeColor(speed: number | null, earthDirected: boolean): number {
 const CME_MAX_AU = 1.8; // clip plumes inside the inner-system framing radius
 const CME_FADE_DAYS = 6; // a plume lingers ~6 days after launch, then fades out
 const FLARE_GLOW_MS = 10 * 60 * 60 * 1000; // active-region flash half-life window
-const SUN_DETAIL_RADIUS = 34; // lazy-load active-solar closeup once the camera is this near
 
 // True-to-scale geocentric body radii (units). Earth is ~1/389 of a lunar
 // distance, so at the scale that shows asteroid fly-bys it is a tiny dot — the
@@ -96,8 +98,84 @@ const EARTH_R = EARTH_RADIUS_KM * GEO_KM; // ≈ 0.0547 units
 const MOON_R = MOON_RADIUS_KM * GEO_KM; // ≈ 0.0149 units
 const SAT_FETCH_RADIUS = 9; // camera radius at which we lazily pull CelesTrak
 
+type DisposalState = {
+  geometries: Set<THREE.BufferGeometry>;
+  materials: Set<THREE.Material>;
+  textures: Set<THREE.Texture>;
+};
+
+function createDisposalState(): DisposalState {
+  return {
+    geometries: new Set(),
+    materials: new Set(),
+    textures: new Set(),
+  };
+}
+
+function disposeTexture(texture: THREE.Texture, state: DisposalState) {
+  if (state.textures.has(texture)) return;
+  state.textures.add(texture);
+  texture.dispose();
+}
+
+function disposeUniformTextures(value: unknown, state: DisposalState, visited = new Set<object>()) {
+  if (value instanceof THREE.Texture) {
+    disposeTexture(value, state);
+    return;
+  }
+  if (!value || typeof value !== "object" || ArrayBuffer.isView(value)) return;
+  if (visited.has(value)) return;
+  visited.add(value);
+  for (const nested of Object.values(value)) disposeUniformTextures(nested, state, visited);
+}
+
+function disposeMaterialResources(material: THREE.Material, state: DisposalState) {
+  if (state.materials.has(material)) return;
+  state.materials.add(material);
+  for (const value of Object.values(material)) {
+    if (value instanceof THREE.Texture) disposeTexture(value, state);
+  }
+  if (material instanceof THREE.ShaderMaterial) {
+    disposeUniformTextures(material.uniforms, state);
+  }
+  material.dispose();
+}
+
+function disposeObjectResources(root: THREE.Object3D, state = createDisposalState()) {
+  root.traverse((object) => {
+    const resource = object as THREE.Object3D & {
+      geometry?: THREE.BufferGeometry;
+      material?: THREE.Material | THREE.Material[];
+    };
+    if (resource.geometry && !state.geometries.has(resource.geometry)) {
+      state.geometries.add(resource.geometry);
+      resource.geometry.dispose();
+    }
+    const materials = resource.material == null
+      ? []
+      : Array.isArray(resource.material) ? resource.material : [resource.material];
+    for (const material of materials) disposeMaterialResources(material, state);
+  });
+  if (root instanceof THREE.Scene) {
+    if (root.background instanceof THREE.Texture) disposeTexture(root.background, state);
+    if (root.environment instanceof THREE.Texture) disposeTexture(root.environment, state);
+  }
+}
+
 function toThree(e: {x: number;y: number;z: number;}, scale: number): THREE.Vector3 {
   return new THREE.Vector3(e.x * scale, e.z * scale, -e.y * scale);
+}
+
+function helioSceneRadius(au: number): number {
+  if (au <= HELIO_LINEAR_AU) return au * AU_SCALE;
+  return HELIO_LINEAR_AU * AU_SCALE + Math.log1p(au - HELIO_LINEAR_AU) * 96;
+}
+
+function toHelio(e: {x: number;y: number;z: number;}): THREE.Vector3 {
+  const au = Math.hypot(e.x, e.y, e.z);
+  if (au < 1e-8) return new THREE.Vector3();
+  const s = helioSceneRadius(au) / au;
+  return toThree(e, s);
 }
 
 function ringPoints(r: number, seg = 160): THREE.Vector3[] {
@@ -119,16 +197,19 @@ export function Scene3D(props: Props) {
     objects, elements, windowMin, windowMax, scrubberMs,
     selectedId, selectedDes, onSelect, mode,
     variant = "main", onActivate, satellites, onNearEarth,
-    cmes, flares, layers } = props;
+    cmes, flares, layers, spacecraft, onSelectCraft } = props;
   const isMini = variant === "mini";
   const showOrbits = layers?.orbits ?? true;
-  const showCmes = layers?.cmes ?? true;
-  const showFlares = layers?.flares ?? true;
-  const showSolar = layers?.solar ?? true;
+  // On the mini map the Sun is always drawn as a plain sphere — the solar
+  // activity / CME / flare layers are forced off regardless of the toggles.
+  const showCmes = isMini ? false : (layers?.cmes ?? true);
+  const showFlares = isMini ? false : (layers?.flares ?? true);
+  const showSolar = isMini ? false : (layers?.solar ?? true);
 
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
+  const [rendererError, setRendererError] = useState(false);
 
   const labelHost = useRef<HTMLDivElement | null>(null);
   const bodyHost = useRef<HTMLDivElement | null>(null);
@@ -146,6 +227,8 @@ export function Scene3D(props: Props) {
   satsRef.current = satellites ?? [];
   const onNearEarthRef = useRef(onNearEarth);
   onNearEarthRef.current = onNearEarth;
+  const onSelectCraftRef = useRef(onSelectCraft);
+  onSelectCraftRef.current = onSelectCraft;
   const nearFired = useRef(false);
 
   const three = useRef<{
@@ -163,6 +246,7 @@ export function Scene3D(props: Props) {
   const allowAuto = useRef(true);
   const pickList = useRef<THREE.Object3D[]>([]);
   const pickMap = useRef<Map<THREE.Object3D, NeoObject>>(new Map());
+  const craftPickMap = useRef<Map<THREE.Object3D, SpacecraftVehicle>>(new Map());
   const dynUpdate = useRef<(() => void) | null>(null);
   // Hover glow: the marker currently under the cursor (its whole orbit path
   // eases up to a soft bright glow rather than snapping on/off).
@@ -199,7 +283,14 @@ export function Scene3D(props: Props) {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    } catch {
+      setRendererError(true);
+      return;
+    }
+    setRendererError(false);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 9000);
@@ -291,9 +382,10 @@ export function Scene3D(props: Props) {
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       poke();
-      // GEO min is tiny for Earth. HELIO min lets you fly into the solar
-      // corona close enough to resolve the lazy-loaded flare animation.
-      const min = modeRef.current === "GEO" ? 0.12 : 10;
+      // GEO min is tiny so you can fly right down to the true-scale globe and
+      // pick out individual satellites; max frames the full ~20 LD field. The
+      // mini map lets you push in much closer than the main heliocentric view.
+      const min = modeRef.current === "GEO" ? 0.12 : isMini ? 8 : 70;
       const max = modeRef.current === "GEO" ? 340 : 900;
       cam.current.target = Math.max(min, Math.min(max, cam.current.target * (1 + e.deltaY * 0.0012)));
     };
@@ -310,6 +402,8 @@ export function Scene3D(props: Props) {
       if (hits.length) {
         const obj = pickMap.current.get(hits[0].object);
         if (obj) { audio.play("select"); onSelect(obj); }
+        const craft = craftPickMap.current.get(hits[0].object);
+        if (craft) { audio.play("select"); onSelectCraftRef.current?.(craft); }
       }
     };
 
@@ -334,7 +428,7 @@ export function Scene3D(props: Props) {
       const d = pinchDist(e.touches);
       const ratio = pinchDist0 / d; // >1 fingers closer → zoom out, <1 → zoom in
       pinchDist0 = d;
-      const min = modeRef.current === "GEO" ? 0.12 : 10;
+      const min = modeRef.current === "GEO" ? 0.12 : isMini ? 8 : 70;
       const max = modeRef.current === "GEO" ? 340 : 900;
       cam.current.target = Math.max(min, Math.min(max, cam.current.target * ratio));
     };
@@ -344,6 +438,13 @@ export function Scene3D(props: Props) {
       canvas.addEventListener("pointerdown", onDown);
       canvas.addEventListener("pointermove", onMove);
       canvas.addEventListener("pointerup", onUp);
+      canvas.addEventListener("wheel", onWheel, { passive: false });
+      canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+      canvas.addEventListener("touchmove", onTouchMove, { passive: false });
+      canvas.addEventListener("touchend", onTouchEnd);
+    } else {
+      // The mini map still promotes on click, but supports zoom so operators can
+      // push in on the plain-sphere Sun without opening the full view.
       canvas.addEventListener("wheel", onWheel, { passive: false });
       canvas.addEventListener("touchstart", onTouchStart, { passive: false });
       canvas.addEventListener("touchmove", onTouchMove, { passive: false });
@@ -438,7 +539,9 @@ export function Scene3D(props: Props) {
       canvas.removeEventListener("touchstart", onTouchStart);
       canvas.removeEventListener("touchmove", onTouchMove);
       canvas.removeEventListener("touchend", onTouchEnd);
+      disposeObjectResources(scene);
       renderer.dispose();
+      dynUpdate.current = null;
       three.current = null;
     };
   }, [onSelect, isMini]);
@@ -454,7 +557,7 @@ export function Scene3D(props: Props) {
 
   // Reset zoom target when mode changes.
   useEffect(() => {
-    cam.current.target = mode === "GEO" ? 120 : 170;
+    cam.current.target = mode === "GEO" ? 120 : 200;
   }, [mode]);
 
   // Build scene contents on data / mode change.
@@ -463,17 +566,18 @@ export function Scene3D(props: Props) {
     if (!t) return;
     const scene = t.scene;
     // clear everything except the persistent selection ring
+    const disposal = createDisposalState();
     for (let i = scene.children.length - 1; i >= 0; i--) {
-      const c = scene.children[i] as any;
+      const c = scene.children[i];
       if (c === t.selRing) continue;
       scene.remove(c);
-      c.geometry?.dispose?.();
-      if (Array.isArray(c.material)) c.material.forEach((m: any) => m.dispose?.());else
-      c.material?.dispose?.();
+      disposeObjectResources(c, disposal);
     }
+    dynUpdate.current = null;
     t.selRing.visible = false;
     pickList.current = [];
     pickMap.current = new Map();
+    craftPickMap.current = new Map();
     markerById.current = new Map();
     // old hovered meshes are being disposed — drop all glow bookkeeping
     glowReg.current = new Map();
@@ -483,14 +587,15 @@ export function Scene3D(props: Props) {
     // Record a marker + its orbit path so the hover glow can light both up.
     const registerGlow = (marker: THREE.Mesh, trail: THREE.Object3D | null) => {
       const mm = marker.material as THREE.MeshBasicMaterial;
+      const trailMat = trail ? (trail as any).material : null;
       const tm =
-      trail && (trail as THREE.Mesh).material instanceof THREE.MeshBasicMaterial ?
-      (trail as THREE.Mesh).material as THREE.MeshBasicMaterial : null;
+      trailMat && trailMat.color && typeof trailMat.opacity === "number" ?
+      trailMat as THREE.Material & { color: THREE.Color; opacity: number } : null;
       const baseTrailOp = tm ? tm.opacity : 0;
       glowReg.current.set(marker, {
         markerMat: mm,
         baseMarker: mm.color.clone(),
-        trailMat: tm,
+        trailMat: tm as THREE.MeshBasicMaterial | null,
         baseTrail: tm ? tm.color.clone() : new THREE.Color(),
         baseTrailOp,
         glowTrailOp: Math.min(0.85, Math.max(0.5, baseTrailOp * 12 + 0.45))
@@ -516,6 +621,14 @@ export function Scene3D(props: Props) {
       const geo = new THREE.BufferGeometry().setFromPoints(pts);
       const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity });
       return loop ? new THREE.LineLoop(geo, mat) : new THREE.Line(geo, mat);
+    };
+
+    const dottedLine = (pts: THREE.Vector3[], color: number, opacity: number) => {
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 3.2, gapSize: 2.4 });
+      const line = new THREE.Line(geo, mat);
+      line.computeLineDistances();
+      return line;
     };
 
     // Tube-based "fat" line — WebGL ignores LineBasicMaterial.linewidth, so real
@@ -565,8 +678,8 @@ export function Scene3D(props: Props) {
 
     if (mode === "HELIO") {
       if (showOrbits) {
-        for (const au of [0.5, 1, 1.5, 2]) {
-          scene.add(dimLine(ringPoints(au * AU_SCALE), AMBER_DIM, au === 1 ? 0.35 : 0.16, true));
+        for (const au of [0.39, 0.72, 1, 1.52, 5.2, 9.6, 19.2, 30.1, 60, 120, 165]) {
+          scene.add(dimLine(ringPoints(helioSceneRadius(au)), AMBER_DIM, au === 1 ? 0.35 : au > 40 ? 0.1 : 0.16, true));
         }
       }
       // ---- Sun: layered photosphere + corona + billboarded glow halo --------
@@ -574,48 +687,50 @@ export function Scene3D(props: Props) {
       const sun = new THREE.Group();
       scene.add(sun);
       // Photosphere core.
-      const sunCoreMat = new THREE.MeshBasicMaterial({ color: 0xffb24a, transparent: true, opacity: 0.94 });
       sun.add(new THREE.Mesh(
         new THREE.SphereGeometry(SUN_R, 32, 32),
-        sunCoreMat
+        new THREE.MeshBasicMaterial({ color: 0xffe39a })
       ));
-      // Granulation shimmer — a thin offset wireframe shell that mottles the limb.
-      sun.add(new THREE.Mesh(
-        new THREE.SphereGeometry(SUN_R * 1.012, 28, 20),
-        new THREE.MeshBasicMaterial({ color: CME_FAST, wireframe: true, transparent: true, opacity: showSolar ? 0.22 : 0.08 })
-      ));
-      // Additive corona shells, warm → dim, growing outward.
+      // Additive corona shells, warm → dim, growing outward. All of the Sun's
+      // embellishments (granulation shimmer, corona, glow halo, ring) are dropped
+      // on the mini map so it stays a clean, plain sphere.
       const coronaShells: Array<{ mat: THREE.MeshBasicMaterial; base: number }> = [];
-      const shellSpec: Array<[number, number, number]> = [
-        [SUN_R * 1.25, 0xffb24a, 0.3],
-        [SUN_R * 1.7, CME_FAST, 0.16],
-        [SUN_R * 2.5, CME_EXTREME, 0.08],
-      ];
-      for (const [r, color, op] of shellSpec) {
-        const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: op, blending: THREE.AdditiveBlending, depthWrite: false });
-        sun.add(new THREE.Mesh(new THREE.SphereGeometry(r, 28, 24), mat));
-        coronaShells.push({ mat, base: op });
+      if (!isMini) {
+        // Granulation shimmer — a thin offset wireframe shell that mottles the limb.
+        sun.add(new THREE.Mesh(
+          new THREE.SphereGeometry(SUN_R * 1.012, 28, 20),
+          new THREE.MeshBasicMaterial({ color: CME_FAST, wireframe: true, transparent: true, opacity: showSolar ? 0.22 : 0.08 })
+        ));
+        const shellSpec: Array<[number, number, number]> = [
+          [SUN_R * 1.25, 0xffb24a, 0.3],
+          [SUN_R * 1.7, CME_FAST, 0.16],
+          [SUN_R * 2.5, CME_EXTREME, 0.08],
+        ];
+        for (const [r, color, op] of shellSpec) {
+          const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: op, blending: THREE.AdditiveBlending, depthWrite: false });
+          sun.add(new THREE.Mesh(new THREE.SphereGeometry(r, 28, 24), mat));
+          coronaShells.push({ mat, base: op });
+        }
+        // Soft radial-gradient glow sprite (always faces the camera).
+        const glowTex = (() => {
+          const c = document.createElement("canvas");
+          c.width = c.height = 128;
+          const g = c.getContext("2d")!;
+          const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+          grd.addColorStop(0, "rgba(255,228,150,0.95)");
+          grd.addColorStop(0.25, "rgba(255,150,60,0.5)");
+          grd.addColorStop(0.6, "rgba(255,70,40,0.14)");
+          grd.addColorStop(1, "rgba(255,70,40,0)");
+          g.fillStyle = grd;
+          g.fillRect(0, 0, 128, 128);
+          const t = new THREE.CanvasTexture(c);
+          return t;
+        })();
+        const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.75 }));
+        glow.scale.setScalar(SUN_R * 5);
+        sun.add(glow);
+        scene.add(dimLine(ringPoints(SUN_R * 1.7, 64), AMBER, 0.4, true));
       }
-      // Soft radial-gradient glow sprite (always faces the camera).
-      const glowTex = (() => {
-        const c = document.createElement("canvas");
-        c.width = c.height = 128;
-        const g = c.getContext("2d")!;
-        const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
-        grd.addColorStop(0, "rgba(255,228,150,0.95)");
-        grd.addColorStop(0.25, "rgba(255,150,60,0.5)");
-        grd.addColorStop(0.6, "rgba(255,70,40,0.14)");
-        grd.addColorStop(1, "rgba(255,70,40,0)");
-        g.fillStyle = grd;
-        g.fillRect(0, 0, 128, 128);
-        const t = new THREE.CanvasTexture(c);
-        return t;
-      })();
-      const glowMat = new THREE.SpriteMaterial({ map: glowTex, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.55 });
-      const glow = new THREE.Sprite(glowMat);
-      glow.scale.setScalar(SUN_R * 5);
-      sun.add(glow);
-      scene.add(dimLine(ringPoints(SUN_R * 1.7, 64), AMBER, 0.4, true));
       mkLabel("SOL", "var(--amber-bright)", sun);
 
       // ---- Solar activity shell: moving particles + latitude bands -----------
@@ -683,85 +798,6 @@ export function Scene3D(props: Props) {
         flareBursts.push({ group, mat, peakMs: f.peakMs, cls: f.cls });
       }
 
-      // ---- Lazy close-Sun detail --------------------------------------------
-      // Created only after the operator flies into the corona. This keeps the
-      // overview clean, then switches to a richer particle-and-field-line read
-      // inspired by old broadcast solar-wind diagrams.
-      let closeSolar: {
-        group: THREE.Group;
-        surface: THREE.PointsMaterial;
-        sheet: THREE.PointsMaterial;
-        loopMats: THREE.LineBasicMaterial[];
-      } | null = null;
-      const createCloseSolar = () => {
-        if (closeSolar) return closeSolar;
-        const group = new THREE.Group();
-
-        const surfaceCount = 2600;
-        const surfacePos = new Float32Array(surfaceCount * 3);
-        const surfaceCol = new Float32Array(surfaceCount * 3);
-        for (let i = 0; i < surfaceCount; i++) {
-          const u = seeded01(i + 101) * 2 - 1;
-          const a = seeded01(i + 211) * Math.PI * 2;
-          const r = SUN_R * (1.005 + seeded01(i + 307) * 0.09);
-          const s = Math.sqrt(1 - u * u);
-          surfacePos[i * 3] = Math.cos(a) * s * r;
-          surfacePos[i * 3 + 1] = u * r;
-          surfacePos[i * 3 + 2] = Math.sin(a) * s * r;
-          const c = new THREE.Color(i % 7 === 0 ? 0x9cffb2 : i % 4 === 0 ? 0xffe39a : 0xff6a1f);
-          surfaceCol[i * 3] = c.r;surfaceCol[i * 3 + 1] = c.g;surfaceCol[i * 3 + 2] = c.b;
-        }
-        const surfaceGeo = new THREE.BufferGeometry();
-        surfaceGeo.setAttribute("position", new THREE.Float32BufferAttribute(surfacePos, 3));
-        surfaceGeo.setAttribute("color", new THREE.Float32BufferAttribute(surfaceCol, 3));
-        const surface = new THREE.PointsMaterial({ size: 2.15, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
-        group.add(new THREE.Points(surfaceGeo, surface));
-
-        const sheetCount = 1900;
-        const sheetPos = new Float32Array(sheetCount * 3);
-        for (let i = 0; i < sheetCount; i++) {
-          const lane = i % 18;
-          const t0 = seeded01(i * 17 + 41);
-          const wave = seeded01(lane * 59 + 3) * Math.PI * 2;
-          const x = -SUN_R * 0.35 + t0 * SUN_R * 5.8;
-          const y = (lane - 8.5) * SUN_R * 0.18 + Math.sin(t0 * 9 + wave) * SUN_R * 0.18;
-          const z = -SUN_R * 1.35 + seeded01(i * 23 + 9) * SUN_R * 2.7;
-          sheetPos[i * 3] = x;
-          sheetPos[i * 3 + 1] = y;
-          sheetPos[i * 3 + 2] = z;
-        }
-        const sheetGeo = new THREE.BufferGeometry();
-        sheetGeo.setAttribute("position", new THREE.Float32BufferAttribute(sheetPos, 3));
-        const sheet = new THREE.PointsMaterial({ color: 0x54ff8a, size: 2.4, sizeAttenuation: false, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false });
-        const streamSheet = new THREE.Points(sheetGeo, sheet);
-        streamSheet.position.x = SUN_R * 0.65;
-        group.add(streamSheet);
-
-        const loopMats: THREE.LineBasicMaterial[] = [];
-        for (let l = 0; l < 11; l++) {
-          const pts: THREE.Vector3[] = [];
-          const radius = SUN_R * (0.55 + (l % 4) * 0.18);
-          const offset = (l - 5) * SUN_R * 0.17;
-          for (let s = 0; s <= 80; s++) {
-            const a = s / 80 * Math.PI;
-            pts.push(new THREE.Vector3(
-              -SUN_R * 0.55 + Math.cos(a) * radius,
-              offset + Math.sin(a) * radius * 0.72,
-              (l % 2 ? 1 : -1) * SUN_R * 0.42
-            ));
-          }
-          const mat = new THREE.LineBasicMaterial({ color: l % 3 === 0 ? 0xffd76b : 0x9cffb2, transparent: true, opacity: 0 });
-          group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat));
-          loopMats.push(mat);
-        }
-
-        group.visible = false;
-        group.rotation.y = -0.35;
-        sun.add(group);
-        closeSolar = { group, surface, sheet, loopMats };
-        return closeSolar;
-      };
-
       // ---- CME streamers: sparse particles, not opaque cones -----------------
       const NEG_Y = new THREE.Vector3(0, -1, 0);
       const cmeList = showCmes ? (cmes ?? []).filter((c) => c.lat != null && c.lon != null && c.speed != null) : [];
@@ -811,13 +847,13 @@ export function Scene3D(props: Props) {
       const planets = planetStates3D(date0);
       const planetBodies: THREE.Mesh[] = [];
       planets.forEach((p, idx) => {
-        if (p.name === "Jupiter") return; // keep inner-system framing
-        const path = p.path.map((q) => toThree(q, AU_SCALE));
+        const path = p.path.map((q) => toHelio(q));
         const isEarth = p.name === "Earth";
+        const isOuter = !["Mercury", "Venus", "Earth", "Mars"].includes(p.name);
         if (showOrbits) scene.add(fatLine(path, isEarth ? BLUE : AMBER_DIM, isEarth ? 0.75 : 0.4, isEarth ? 0.07 : 0.055, true));
         const body = new THREE.Mesh(
-          new THREE.SphereGeometry(isEarth ? 2.4 : 1.7, 16, 16),
-          new THREE.MeshBasicMaterial({ color: isEarth ? BLUE : 0x8fd8cc })
+          new THREE.SphereGeometry(isEarth ? 2.4 : isOuter ? 2.2 : 1.7, 16, 16),
+          new THREE.MeshBasicMaterial({ color: isEarth ? BLUE : isOuter ? 0xffd76b : 0x8fd8cc })
         );
         scene.add(body);
         (body as any).__idx = idx;
@@ -833,7 +869,7 @@ export function Scene3D(props: Props) {
         const sel = o.id === selRef.current;
         let trail: THREE.Object3D | null = null;
         if (showOrbits && aph < 9) {
-          const path = orbitPath3D(el, 240).map((q) => toThree(q, AU_SCALE));
+          const path = orbitPath3D(el, 240).map((q) => toHelio(q));
           trail = fatLine(path, sel ? AMBER_BRIGHT : o.monitored ? RED : AMBER, sel ? 0.95 : o.monitored ? 0.6 : 0.4, sel ? 0.09 : o.monitored ? 0.065 : 0.05, true);
           scene.add(trail);
         }
@@ -849,39 +885,72 @@ export function Scene3D(props: Props) {
         registerGlow(mk, trail);
       }
 
+      const craftMarkers: Array<{ mesh: THREE.Mesh; craft: SpacecraftVehicle }> = [];
+      const craftSeed = (id: string) =>
+        [...id].reduce((sum, ch, i) => sum + ch.charCodeAt(0) * (i + 3), 0);
+      const craftPosition = (craft: SpacecraftVehicle, d: Date) => {
+        const au = Math.max(0.18, craft.rangeAu ?? 2);
+        const seed = craftSeed(craft.id);
+        const base = seeded01(seed) * Math.PI * 2;
+        const yrs = (d.getTime() - Date.parse(craft.launchDate)) / (365.25 * 86400000);
+        const drift = yrs * (au < 1 ? 1.1 : au < 6 ? 0.22 : 0.025);
+        const a = base + drift;
+        const tilt = (seeded01(seed + 19) - 0.5) * 0.34;
+        return { x: Math.cos(a) * au, y: Math.sin(a) * au, z: Math.sin(tilt) * au * 0.18 };
+      };
+      const craftTrajectory = (craft: SpacecraftVehicle, d: Date) => {
+        const au = Math.max(0.18, craft.rangeAu ?? 2);
+        const seed = craftSeed(craft.id);
+        const base = seeded01(seed) * Math.PI * 2;
+        const yrs = (d.getTime() - Date.parse(craft.launchDate)) / (365.25 * 86400000);
+        const drift = yrs * (au < 1 ? 1.1 : au < 6 ? 0.22 : 0.025);
+        const loops = au < 1 ? 5.5 : au < 6 ? 2.6 : 1.2;
+        const start = Math.min(1, au * 0.72);
+        const pts: THREE.Vector3[] = [];
+        for (let i = 0; i <= 180; i++) {
+          const t0 = i / 180;
+          const r = start + (au - start) * Math.pow(t0, 1.06);
+          const a = base + drift * t0 - (1 - t0) * loops;
+          const tilt = (seeded01(seed + 19) - 0.5) * 0.34;
+          pts.push(toHelio({ x: Math.cos(a) * r, y: Math.sin(a) * r, z: Math.sin(tilt) * r * 0.18 }));
+        }
+        return pts;
+      };
+
+      if (!isMini) {
+        for (const craft of spacecraft ?? []) {
+          const trail = dottedLine(craftTrajectory(craft, date0), ISSC, 0.018);
+          scene.add(trail);
+          const mk = new THREE.Mesh(
+            new THREE.OctahedronGeometry(craft.rangeAu != null && craft.rangeAu > 20 ? 1.95 : 1.45, 0),
+            new THREE.MeshBasicMaterial({ color: ISSC, transparent: true, opacity: 0.95 })
+          );
+          mk.position.copy(toHelio(craftPosition(craft, date0)));
+          scene.add(mk);
+          craftMarkers.push({ mesh: mk, craft });
+          pickList.current.push(mk);
+          craftPickMap.current.set(mk, craft);
+          registerGlow(mk, trail);
+          mkLabel(craft.shortName, "var(--green)", mk);
+        }
+      }
+
       dynUpdate.current = () => {
         const d = new Date(scrubRef.current);
         const nowMs = d.getTime();
         const ps = planetStates3D(d);
         for (const b of planetBodies) {
           const idx = (b as any).__idx as number;
-          b.position.copy(toThree(ps[idx].pos, AU_SCALE));
+          b.position.copy(toHelio(ps[idx].pos));
         }
-        for (const nm of neoMarkers) nm.mesh.position.copy(toThree(orbitPosition(nm.el, d), AU_SCALE));
+        for (const nm of neoMarkers) nm.mesh.position.copy(toHelio(orbitPosition(nm.el, d)));
+        for (const cm of craftMarkers) cm.mesh.position.copy(toHelio(craftPosition(cm.craft, d)));
 
         // Corona breathes; a slow idle pulse keeps the Sun alive on screen.
         const breathe = 1 + 0.05 * Math.sin(nowMs / 4.5e6);
         for (const sh of coronaShells) sh.mat.opacity = sh.base * breathe;
         solarActivity.rotation.y = nowMs / 1.8e7;
         solarActivity.rotation.z = Math.sin(nowMs / 2.8e7) * 0.18;
-
-        const shouldShowCloseSolar = !isMini && cam.current.radius < SUN_DETAIL_RADIUS && (showSolar || showFlares);
-        const detail = shouldShowCloseSolar ? createCloseSolar() : closeSolar;
-        const closeFade = shouldShowCloseSolar ? Math.min(1, (SUN_DETAIL_RADIUS - cam.current.radius) / 12) : 0;
-        sunCoreMat.opacity = 0.94 - closeFade * 0.34;
-        sunCoreMat.color.setHex(closeFade > 0.02 ? 0xff6a1f : 0xffb24a);
-        glowMat.opacity = 0.55 - closeFade * 0.43;
-        if (detail) {
-          const fadeIn = closeFade;
-          detail.group.visible = fadeIn > 0.02;
-          detail.group.rotation.y = nowMs / 8.5e6;
-          detail.group.rotation.z = Math.sin(nowMs / 6.2e6) * 0.18;
-          detail.surface.opacity = fadeIn * (showSolar ? 0.95 : 0.2);
-          detail.sheet.opacity = fadeIn * (showFlares ? 0.82 : 0.22);
-          detail.loopMats.forEach((m, i) => {
-            m.opacity = fadeIn * (0.18 + 0.16 * Math.sin(nowMs / 1.9e6 + i));
-          });
-        }
 
         // Flare bursts: particles flare up near peak time, then fade away.
         for (const fp of flareBursts) {
@@ -1085,7 +1154,7 @@ export function Scene3D(props: Props) {
         }
       };
     }
-  }, [mode, plotted, elements, windowMin, windowMax, selectedId, isMini, satellites, cmes, flares, showOrbits, showCmes, showFlares, showSolar]);
+  }, [mode, plotted, elements, windowMin, windowMax, selectedId, isMini, satellites, cmes, flares, spacecraft, showOrbits, showCmes, showFlares, showSolar]);
 
   const labelList = useMemo(
     // Heliocentric map shows icons only — no asteroid name labels.
@@ -1104,6 +1173,11 @@ export function Scene3D(props: Props) {
         style={{ cursor: "pointer" }}
         aria-label="Promote this view to the main map">
         <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" />
+        {rendererError && (
+          <div className="absolute inset-0 flex items-center justify-center bg-[rgba(5,4,10,0.62)] text-[10px] text-[var(--amber-dim)]">
+            ▸ 3D CONTEXT UNAVAILABLE
+          </div>
+        )}
         <div className="pointer-events-none absolute inset-0 bg-[rgba(240,179,42,0)] transition-colors group-hover:bg-[rgba(240,179,42,0.06)]" />
         <div className="pointer-events-none absolute bottom-1.5 left-2 text-[9px] tracking-wide text-[var(--text-dim)] opacity-0 transition-opacity group-hover:opacity-100">
           ▸ CLICK TO PROMOTE
@@ -1115,6 +1189,12 @@ export function Scene3D(props: Props) {
   return (
     <div ref={wrapRef} className="relative h-full w-full overflow-hidden">
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" style={{ cursor: "grab", touchAction: "none" }} />
+      {rendererError && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-[rgba(5,4,10,0.62)] text-center text-[12px] text-[var(--amber-dim)]">
+          <div className="text-[var(--orange)] glow-text">▸ 3D MAP OFFLINE</div>
+          <div>WEBGL CONTEXT UNAVAILABLE</div>
+        </div>
+      )}
       <div ref={bodyHost} className="pointer-events-none absolute inset-0 overflow-hidden" />
       <div ref={labelHost} className="pointer-events-none absolute inset-0 overflow-hidden">
         {labelList.map((o) =>
@@ -1148,7 +1228,7 @@ export function Scene3D(props: Props) {
         <> &nbsp;|&nbsp; TRUE SCALE &nbsp;|&nbsp; {(satellites?.length ?? 0) > 0 ?
           <span><span className="text-[var(--cyan)]">◇ SATELLITES</span> CELESTRAK · <span className="text-[var(--amber)]">◆ ASTEROIDS</span> JPL</span> :
           <span>ZOOM IN ▸ TRACK SATELLITES</span>}</> :
-        <> &nbsp;|&nbsp; LAYERS <span className="text-[var(--orange)]">CME</span>/<span className="text-[var(--red)]">FLR</span>/<span className="text-[var(--green)]">SOL</span> &nbsp;|&nbsp; ORBITS · JPL SBDB</>}
+        <> &nbsp;|&nbsp; <span className="text-[var(--orange)]">• CME PARTICLES</span> DONKI &nbsp;|&nbsp; <span className="text-[var(--green)]">◇ SPACECRAFT</span> HOVER · TRAJECTORY</>}
       </div>
     </div>);
 

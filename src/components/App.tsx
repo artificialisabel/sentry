@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CadResponse, ElementsResponse, NeoObject, OrbitElements, SatCat, SatElements, SatResponse, SbdbResponse, SpaceWeatherResponse } from "../lib/types";
+import type { CadResponse, ElementsResponse, NeoObject, OrbitElements, SatCat, SatElements, SatResponse, SbdbResponse, SpaceWeatherResponse, SpacecraftResponse } from "../lib/types";
 import { Scene3D } from "./Scene3D";
 import type { SceneLayers } from "./Scene3D";
-import { RadarMap } from "./RadarMap";
 import { DataFeed } from "./DataFeed";
 import { DetailPanel } from "./DetailPanel";
 import { TimeScrubber } from "./TimeScrubber";
-import { SolarWindMap, FlareTimeline, KpGauge, spaceWeatherStatus } from "./SpaceWeather";
+import { spaceWeatherStatus } from "./SpaceWeather";
+import { SpacecraftPanel } from "./SpacecraftPanel";
+import { SpacecraftModelView } from "./SpacecraftModelView";
 import { fmtUTC, fmtDuration } from "../lib/format";
 import { audio, installUiSounds } from "../lib/audio";
 
@@ -22,17 +23,33 @@ const SAT_LEGEND: Array<{cat: SatCat;color: string;label: string;}> = [
 { cat: "other", color: "#8a93b5", label: "OTHER" }];
 
 const EMPTY_COUNTS: Record<SatCat, number> = { starlink: 0, oneweb: 0, weather: 0, gps: 0, geo: 0, other: 0 };
-const HELIO_LAYER_BUTTONS: Array<{ key: keyof SceneLayers; label: string; mark: string; color: string; hint: string; }> = [
-  { key: "orbits", label: "ORB", mark: "◎", color: "var(--amber)", hint: "JPL SBDB asteroid and planet orbit paths." },
-  { key: "cmes", label: "CME", mark: "•", color: "var(--orange)", hint: "DONKI coronal-mass-ejection particle streamers." },
-  { key: "flares", label: "FLR", mark: "✦", color: "var(--red)", hint: "DONKI solar-flare bursts at active-region bearings." },
-  { key: "solar", label: "SOL", mark: "☉", color: "var(--green)", hint: "Stylised solar surface particles and magnetic loops." },
+const HELIO_LAYER_BUTTONS: Array<{ key: keyof SceneLayers; label: string; mark: string; color: string; hint?: string; }> = [
+  { key: "orbits", label: "ORB", mark: "◎", color: "var(--amber)" },
+  { key: "cmes", label: "CME", mark: "•", color: "var(--orange)", hint: "CME shows NASA DONKI coronal-mass-ejection particle streamers moving through the inner heliosphere." },
+  { key: "flares", label: "FLR", mark: "✦", color: "var(--red)", hint: "FLR shows DONKI solar-flare bursts at their reported active-region bearings on the Sun." },
+  { key: "solar", label: "SOL", mark: "☉", color: "var(--green)", hint: "SOL adds the stylised solar surface particles, corona, and magnetic-loop activity around the Sun." },
 ];
 
 
 // Rounded label tag used for every panel title (matches the reference chrome).
 function TitleTag({ children }: {children: React.ReactNode;}) {
   return <span className="title-tag">{children}</span>;
+}
+
+function CollapseButton({ collapsed, onToggle, label }: { collapsed: boolean; onToggle: () => void; label: string }) {
+  return (
+    <button
+      type="button"
+      data-sfx="select"
+      onClick={(event) => {
+        event.stopPropagation();
+        onToggle();
+      }}
+      className="collapse-marker absolute right-2 top-2 z-30"
+      aria-label={`${collapsed ? "Expand" : "Collapse"} ${label}`}>
+      {collapsed ? "▸" : "▾"}
+    </button>
+  );
 }
 
 // Small crosshair glyph dropped at divider junctions / frame corners.
@@ -48,7 +65,35 @@ function Plus({ at }: {at: "tl" | "tr" | "bl" | "br";}) {
 
 }
 
-type Mode = "GEO" | "HELIO";
+type Mode = "GEO" | "HELIO" | "VEHICLES";
+type PanelKey = "mini" | "radar" | "feed";
+type ResizeKind = "desktop-left" | "desktop-mini" | "desktop-radar" | "mobile-main" | "mobile-left";
+type PanelSizes = { left: number; mini: number; radar: number; mobileMain: number; mobileLeft: number };
+
+const PANEL_MIN = 38;
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+function resizeLimits(
+  kind: ResizeKind,
+  width: number,
+  height: number,
+  sizes: PanelSizes,
+  collapsed: Record<PanelKey, boolean>
+) {
+  if (kind === "desktop-left") return { min: 220, max: Math.max(260, width - 360) };
+  if (kind === "desktop-mini") {
+    const radarMin = collapsed.radar ? PANEL_MIN : 112;
+    const feedMin = collapsed.feed ? PANEL_MIN : 132;
+    return { min: 74, max: Math.max(74, height - radarMin - feedMin) };
+  }
+  if (kind === "desktop-radar") {
+    const miniHeight = collapsed.mini ? PANEL_MIN : sizes.mini;
+    const feedMin = collapsed.feed ? PANEL_MIN : 132;
+    return { min: 86, max: Math.max(86, height - miniHeight - feedMin) };
+  }
+  if (kind === "mobile-main") return { min: 36, max: 74 };
+  return { min: 32, max: 68 };
+}
 
 export function App() {
   const [data, setData] = useState<CadResponse | null>(null);
@@ -70,9 +115,17 @@ export function App() {
   const [satCached, setSatCached] = useState<number | null>(null);
   const satReq = useRef(false);
   const [sw, setSw] = useState<SpaceWeatherResponse | null>(null);
-  const [helioLayers, setHelioLayers] = useState<SceneLayers>({ orbits: true, cmes: false, flares: false, solar: false });
+  const [spacecraft, setSpacecraft] = useState<SpacecraftResponse | null>(null);
+  const [spacecraftLoading, setSpacecraftLoading] = useState(false);
+  const [selectedCraftId, setSelectedCraftId] = useState<string | null>(null);
+  const [helioLayers, setHelioLayers] = useState<SceneLayers>({ orbits: true, cmes: true, flares: true, solar: true });
+  const [helioLayerHint, setHelioLayerHint] = useState<string | null>(null);
   const [soundOn, setSoundOn] = useState(true);
   const [sfxReady, setSfxReady] = useState(false);
+  const [collapsed, setCollapsed] = useState<Record<PanelKey, boolean>>({ mini: false, radar: false, feed: false });
+  const [panelSizes, setPanelSizes] = useState<PanelSizes>({ left: 300, mini: 190, radar: 210, mobileMain: 60, mobileLeft: 50 });
+  const [gridSize, setGridSize] = useState({ width: 0, height: 0 });
+  const gridRef = useRef<HTMLDivElement | null>(null);
   const [nowMs, setNowMs] = useState(Date.now());
   const sbdbCache = useRef<Map<string, SbdbResponse>>(new Map());
 
@@ -81,6 +134,19 @@ export function App() {
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 60_000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    const updateGridSize = () => {
+      const { width, height } = grid.getBoundingClientRect();
+      setGridSize((current) => current.width === width && current.height === height ? current : { width, height });
+    };
+    updateGridSize();
+    const observer = new ResizeObserver(updateGridSize);
+    observer.observe(grid);
+    return () => observer.disconnect();
   }, []);
 
   // Bring the console to life with retro-futurist audio: a spacecraft ambient
@@ -115,6 +181,81 @@ export function App() {
   const toggleHelioLayer = useCallback((key: keyof SceneLayers) => {
     setHelioLayers((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
+
+  const togglePanel = useCallback((panel: PanelKey) => {
+    setCollapsed((prev) => ({ ...prev, [panel]: !prev[panel] }));
+  }, []);
+
+  const beginResize = useCallback((kind: ResizeKind) => (event: React.PointerEvent<HTMLDivElement>) => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    event.preventDefault();
+    if (kind === "desktop-mini") setCollapsed((prev) => ({ ...prev, mini: false }));
+    if (kind === "desktop-radar") setCollapsed((prev) => ({ ...prev, radar: false }));
+
+    document.body.classList.add("resizing-panels");
+    const move = (pointerEvent: PointerEvent) => {
+      const rect = grid.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      setPanelSizes((prev) => {
+        if (kind === "desktop-left") {
+          return { ...prev, left: clamp(pointerEvent.clientX - rect.left, 220, Math.max(260, rect.width - 360)) };
+        }
+        if (kind === "desktop-mini") {
+          const radarMin = collapsed.radar ? PANEL_MIN : 112;
+          const feedMin = collapsed.feed ? PANEL_MIN : 132;
+          const max = Math.max(74, rect.height - radarMin - feedMin);
+          return { ...prev, mini: clamp(pointerEvent.clientY - rect.top, 74, max) };
+        }
+        if (kind === "desktop-radar") {
+          const miniHeight = collapsed.mini ? PANEL_MIN : prev.mini;
+          const feedMin = collapsed.feed ? PANEL_MIN : 132;
+          const max = Math.max(86, rect.height - miniHeight - feedMin);
+          return { ...prev, radar: clamp(pointerEvent.clientY - rect.top - miniHeight, 86, max) };
+        }
+        if (kind === "mobile-main") {
+          return { ...prev, mobileMain: clamp((pointerEvent.clientY - rect.top) / rect.height * 100, 36, 74) };
+        }
+        return { ...prev, mobileLeft: clamp((pointerEvent.clientX - rect.left) / rect.width * 100, 32, 68) };
+      });
+    };
+    const end = () => {
+      document.body.classList.remove("resizing-panels");
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  }, [collapsed]);
+
+  const resizeWithKeyboard = useCallback((kind: ResizeKind) => (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const vertical = kind === "desktop-left" || kind === "mobile-left";
+    const decreaseKey = vertical ? "ArrowLeft" : "ArrowUp";
+    const increaseKey = vertical ? "ArrowRight" : "ArrowDown";
+    if (event.key !== decreaseKey && event.key !== increaseKey && event.key !== "Home" && event.key !== "End") return;
+
+    const grid = gridRef.current;
+    if (!grid) return;
+    event.preventDefault();
+    if (kind === "desktop-mini") setCollapsed((prev) => ({ ...prev, mini: false }));
+    if (kind === "desktop-radar") setCollapsed((prev) => ({ ...prev, radar: false }));
+
+    const { width, height } = grid.getBoundingClientRect();
+    setPanelSizes((prev) => {
+      const { min, max } = resizeLimits(kind, width, height, prev, collapsed);
+      const step = kind === "mobile-main" || kind === "mobile-left" ? 2 : 10;
+      const delta = event.key === decreaseKey ? -step : step;
+      const next = (current: number) => event.key === "Home" ? min : event.key === "End" ? max : clamp(current + delta, min, max);
+
+      if (kind === "desktop-left") return { ...prev, left: next(prev.left) };
+      if (kind === "desktop-mini") return { ...prev, mini: next(prev.mini) };
+      if (kind === "desktop-radar") return { ...prev, radar: next(prev.radar) };
+      if (kind === "mobile-main") return { ...prev, mobileMain: next(prev.mobileMain) };
+      return { ...prev, mobileLeft: next(prev.mobileLeft) };
+    });
+  }, [collapsed]);
 
   useEffect(() => {
     let alive = true;
@@ -175,6 +316,31 @@ export function App() {
       if (earthDir) log(`▸ ${earthDir} EARTH-DIRECTED CME${earthDir > 1 ? "S" : ""} · ENLIL FLAGGED`);
     }).
     catch(() => {if (alive) log("▸ DONKI UPLINK ERR");});
+    return () => {alive = false;};
+  }, [log]);
+
+  // The spacecraft archive is a curated NASA/JPL roster with public model and
+  // reference links. Loading it independently keeps asteroid tracking usable
+  // if one of the archive sources is temporarily unavailable.
+  useEffect(() => {
+    let alive = true;
+    setSpacecraftLoading(true);
+    fetch("/app-api/spacecraft").
+    then((r) => r.json()).
+    then((d: SpacecraftResponse) => {
+      if (!alive) return;
+      setSpacecraftLoading(false);
+      if (!d.ok) {log("▸ SPACECRAFT DATA ERR");return;}
+      setSpacecraft(d);
+      const imageHits = d.requests.reduce((sum, request) =>
+        sum + (request.label.startsWith("NASA Images") ? request.count : 0), 0);
+      if (d.cached) {
+        const age = d.cachedAt ? new Date(d.cachedAt).toISOString().slice(0, 16).replace("T", " ") : "";
+        log(`▸ SPACECRAFT DATA CACHED · ${age}Z`);
+      }
+      log(`▸ NASA SPACECRAFT DATA · ${d.vehicles.length} CRAFT · ${imageHits} IMAGE RECORDS`);
+    }).
+    catch(() => {if (alive) {setSpacecraftLoading(false);log("▸ SPACECRAFT DATA ERR");}});
     return () => {alive = false;};
   }, [log]);
 
@@ -250,12 +416,13 @@ export function App() {
   }, [log]);
 
   const swStatus = useMemo(() => spaceWeatherStatus(sw, scrubberMs), [sw, scrubberMs]);
-  const otherMode: Mode = mode === "GEO" ? "HELIO" : "GEO";
+  const otherMode: "GEO" | "HELIO" = mode === "GEO" ? "HELIO" : "GEO";
   const monitoredCount = data ? data.objects.filter((o) => o.monitored).length : 0;
   const plottedCount = useMemo(
     () => data ? data.objects.filter((o) => elements[o.des]).length : 0,
     [data, elements]
   );
+  const previewCraft = spacecraft?.vehicles.find((vehicle) => vehicle.id === selectedCraftId) ?? spacecraft?.vehicles[0] ?? null;
 
   // Next approach = the soonest close encounter still ahead of the active clock
   // (falls back to the most recent if every pass in the window is behind us).
@@ -268,16 +435,54 @@ export function App() {
     return [...data.objects].sort((a, b) => b.epochMs - a.epochMs)[0] ?? null;
   }, [data, scrubberMs]);
 
+  const gridStyle = useMemo(() => ({
+    "--panel-left": `${panelSizes.left}px`,
+    "--panel-mini": collapsed.mini ? `${PANEL_MIN}px` : `${panelSizes.mini}px`,
+    "--panel-radar": collapsed.radar ? `${PANEL_MIN}px` : collapsed.feed ? `minmax(${panelSizes.radar}px, 1fr)` : `${panelSizes.radar}px`,
+    "--panel-feed": collapsed.feed ? `${PANEL_MIN}px` : "minmax(132px, 1fr)",
+    "--mobile-main": `${panelSizes.mobileMain}%`,
+    "--mobile-left": `${panelSizes.mobileLeft}%`,
+    "--mobile-mini": collapsed.mini ? `${PANEL_MIN}px` : "minmax(96px, 1fr)",
+    "--mobile-radar": collapsed.radar ? `${PANEL_MIN}px` : "minmax(96px, 1fr)",
+  }) as React.CSSProperties, [collapsed, panelSizes]);
+
+  const resizeA11y = useMemo(() => {
+    const width = gridSize.width || panelSizes.left + 360;
+    const height = gridSize.height || panelSizes.mini + panelSizes.radar + 132;
+    const metric = (kind: ResizeKind, rawValue: number, unit: "pixels" | "percent", collapsedPanel = false) => {
+      const limits = resizeLimits(kind, width, height, panelSizes, collapsed);
+      const value = collapsedPanel ? PANEL_MIN : rawValue;
+      const min = collapsedPanel ? PANEL_MIN : limits.min;
+      return {
+        min,
+        max: Math.max(min, limits.max, value),
+        now: value,
+        text: collapsedPanel ? `Collapsed; ${Math.round(rawValue)} ${unit} when expanded` : `${Math.round(value)} ${unit}`,
+      };
+    };
+    return {
+      desktopLeft: metric("desktop-left", panelSizes.left, "pixels"),
+      desktopMini: metric("desktop-mini", panelSizes.mini, "pixels", collapsed.mini),
+      desktopRadar: metric("desktop-radar", panelSizes.radar, "pixels", collapsed.radar),
+      mobileMain: metric("mobile-main", panelSizes.mobileMain, "percent"),
+      mobileLeft: metric("mobile-left", panelSizes.mobileLeft, "percent"),
+    };
+  }, [collapsed, gridSize, panelSizes]);
+
   return (
     <div className="flex h-full w-full flex-col bg-[var(--bg)] p-2 text-[var(--amber)]">
       {/* body — one console frame, panels split by hairline dividers + crosshairs */}
-      <div className="console-grid relative min-h-0 flex-1 border border-[var(--line)]">
+      <div ref={gridRef} className="console-grid relative min-h-0 flex-1 border border-[var(--line)]" style={gridStyle}>
         {/* frame corners */}
         <Plus at="tl" /><Plus at="tr" /><Plus at="bl" /><Plus at="br" />
-        {/* geo/other-mode mini map */}
+        {/* First inactive map. In craft mode this is the geocentric view. */}
         <section className="area-mini relative flex min-h-0 flex-col overflow-hidden border-b border-r border-[var(--line)]">
-            <div className="absolute left-2 top-2 z-20"><TitleTag>{otherMode === "GEO" ? "EARTH MINI MAP" : "SOLAR MINI MAP"}</TitleTag></div>
+            <div className="absolute left-2 top-2 z-20">
+              <TitleTag>{otherMode === "GEO" ? "GEOCENTRIC" : "HELIOCENTRIC"}</TitleTag>
+            </div>
+            <CollapseButton collapsed={collapsed.mini} onToggle={() => togglePanel("mini")} label={`${otherMode} map`} />
             <Plus at="bl" /><Plus at="br" />
+            {!collapsed.mini &&
             <div className="min-h-0 flex-1">
               {status === "ready" && data ?
             <Scene3D
@@ -294,34 +499,76 @@ export function App() {
               onActivate={() => setMode(otherMode)} /> :
             <div className="flex h-full items-center justify-center text-[11px] text-[var(--amber-dim)]">▸ STANDBY</div>}
             </div>
+            }
           </section>
           <section className="area-radar relative flex min-h-0 flex-col overflow-hidden border-r border-[var(--line)] md:border-b">
-            <div className="absolute left-2 top-2 z-20"><TitleTag>TIME / DISTANCE RADAR</TitleTag></div>
+            <div className="absolute left-2 top-2 z-20">
+              <TitleTag>{mode === "VEHICLES" ? "HELIOCENTRIC" : "CRAFT"}</TitleTag>
+            </div>
+            <CollapseButton collapsed={collapsed.radar} onToggle={() => togglePanel("radar")} label={mode === "VEHICLES" ? "heliocentric panel" : "craft panel"} />
             <Plus at="bl" /><Plus at="br" />
+            {!collapsed.radar &&
             <div className="relative min-h-0 flex-1">
-              {status === "ready" && data ?
-            <RadarMap
-              objects={data.objects}
-              windowMin={data.windowMin}
-              windowMax={data.windowMax}
-              scrubberMs={scrubberMs}
-              selectedId={selected?.id ?? null}
-              onSelect={onSelect} /> :
-            <div className="flex h-full items-center justify-center text-[11px] text-[var(--amber-dim)]">▸ STANDBY</div>}
+              {mode === "VEHICLES" && status === "ready" && data ?
+                <Scene3D
+                  objects={data.objects}
+                  elements={elements}
+                  windowMin={data.windowMin}
+                  windowMax={data.windowMax}
+                  scrubberMs={scrubberMs}
+                  selectedId={selected?.id ?? null}
+                  selectedDes={selected?.des ?? null}
+                  onSelect={onSelect}
+                  mode="HELIO"
+                  variant="mini"
+                  cmes={sw?.cmes}
+                  flares={sw?.flares}
+                  layers={helioLayers}
+                  spacecraft={spacecraft?.vehicles}
+                  onActivate={() => setMode("HELIO")} /> :
+                <SpacecraftModelView
+                  vehicle={previewCraft}
+                  loading={spacecraftLoading}
+                  compact
+                  onActivate={() => {
+                    if (previewCraft) setSelectedCraftId(previewCraft.id);
+                    setMode("VEHICLES");
+                  }} />}
             </div>
+            }
           </section>
-          <section className="area-feed relative flex min-h-0 flex-col border-[var(--line)] md:border-r">
-            <div className="px-2 pt-2"><TitleTag>SOURCE / OBJECT FEED</TitleTag></div>
-            <div className="min-h-0 flex-1 p-2">
-              <DataFeed data={data} events={events} onSelect={onSelect} selectedId={selected?.id ?? null} sats={sats} />
+          <section className="area-feed relative flex min-h-0 flex-col overflow-hidden border-[var(--line)] md:border-r">
+            <div className="px-2 pt-2">
+              <TitleTag>SOURCE / OBJECT FEED</TitleTag>
             </div>
+            <CollapseButton collapsed={collapsed.feed} onToggle={() => togglePanel("feed")} label="source object feed" />
+            {!collapsed.feed &&
+            <div className="min-h-0 flex-1 p-2">
+              <DataFeed
+                data={data}
+                events={events}
+                onSelect={onSelect}
+                selectedId={selected?.id ?? null}
+                sats={sats}
+                spacecraft={spacecraft}
+                selectedCraftId={selectedCraftId} />
+            </div>
+            }
           </section>
 
         {/* main map: interactive 3D scene */}
         <div className="area-main relative flex min-h-0 flex-col border-b border-[var(--line)] md:border-b-0">
           <section className="relative flex min-h-0 flex-1 flex-col">
             <div className="relative min-h-0 flex-1">
-              {status === "ready" && data &&
+              {mode === "VEHICLES" &&
+              <SpacecraftPanel
+                data={spacecraft}
+                loading={spacecraftLoading}
+                nowMs={scrubberMs}
+                selectedId={selectedCraftId}
+                onSelectedIdChange={setSelectedCraftId} />
+              }
+              {mode !== "VEHICLES" && status === "ready" && data &&
               <Scene3D
                 objects={data.objects}
                 elements={elements}
@@ -336,23 +583,30 @@ export function App() {
                 onNearEarth={loadSats}
                 cmes={sw?.cmes}
                 flares={sw?.flares}
-                layers={mode === "HELIO" ? helioLayers : undefined} />
+                layers={mode === "HELIO" ? helioLayers : undefined}
+                spacecraft={spacecraft?.vehicles}
+                onSelectCraft={(craft) => {
+                  setSelectedCraftId(craft.id);
+                  setMode("VEHICLES");
+                }} />
               }
-              {status === "loading" &&
+              {mode !== "VEHICLES" && status === "loading" &&
               <div className="flex h-full items-center justify-center text-[14px] text-[var(--amber-dim)]">▸ ACQUIRING CNEOS CLOSE-APPROACH DATA…</div>
               }
-              {status === "error" &&
+              {mode !== "VEHICLES" && status === "error" &&
               <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-[14px] text-[var(--red)]">
                   <div>UPLINK FAILURE</div>
                   <div className="max-w-[60%] text-[12px] text-[var(--text-dim)]">{err}</div>
                 </div>
               }
 
-              {/* single map label — top left */}
-              <div className="absolute left-2 top-2 z-20"><TitleTag>{mode === "GEO" ? "GEOCENTRIC EARTH MAP" : "HELIOCENTRIC SOLAR MAP"}</TitleTag></div>
+              {/* The inactive mini panels are the view switcher. */}
+              <div className="absolute left-2 top-2 z-30 flex max-w-[62vw] flex-wrap items-center gap-1.5">
+                <TitleTag>{mode === "GEO" ? "GEOCENTRIC EARTH MAP" : mode === "HELIO" ? "HELIOCENTRIC SOLAR MAP" : "CRAFT"}</TitleTag>
+              </div>
 
               {mode === "HELIO" &&
-              <div className="absolute left-2 top-11 z-30 flex max-w-[58vw] flex-wrap gap-1.5">
+              <div className="absolute left-2 top-12 z-30 flex max-w-[58vw] flex-wrap gap-1.5">
                 {HELIO_LAYER_BUTTONS.map((b) => {
                   const on = helioLayers[b.key];
                   return (
@@ -362,9 +616,13 @@ export function App() {
                       data-sfx="confirm"
                       aria-pressed={on}
                       aria-label={`${on ? "Hide" : "Show"} ${b.label}`}
-                      title={b.hint}
                       onClick={() => toggleHelioLayer(b.key)}
-                      className="group relative inline-flex h-7 items-center gap-1.5 rounded border-[1.5px] px-2 text-[11px] font-bold tracking-wide transition-colors hover:bg-[rgba(240,179,42,0.1)] focus:outline-none focus-visible:border-[var(--amber-bright)]"
+                      onPointerEnter={() => setHelioLayerHint(b.hint ?? null)}
+                      onPointerMove={() => setHelioLayerHint(b.hint ?? null)}
+                      onPointerLeave={() => setHelioLayerHint(null)}
+                      onFocus={() => setHelioLayerHint(b.hint ?? null)}
+                      onBlur={() => setHelioLayerHint(null)}
+                      className="inline-flex h-7 items-center gap-1.5 rounded border-[1.5px] px-2 text-[11px] font-bold tracking-wide transition-colors hover:bg-[rgba(240,179,42,0.1)] focus:outline-none focus-visible:border-[var(--amber-bright)]"
                       style={{
                         borderColor: on ? b.color : "var(--line)",
                         color: on ? b.color : "var(--text-dim)",
@@ -373,18 +631,17 @@ export function App() {
                       }}>
                       <span className={on ? "glow-text" : undefined}>{b.mark}</span>
                       <span>{b.label}</span>
-                      <span
-                        className="pointer-events-none absolute left-0 top-[calc(100%+6px)] hidden w-[230px] border border-[var(--line)] bg-[rgba(5,4,10,0.88)] px-2 py-1.5 text-left text-[10px] leading-tight text-[var(--text-dim)] shadow-[0_0_14px_rgba(0,0,0,0.75)] backdrop-blur-sm group-hover:block group-focus-visible:block"
-                        style={{ color: on ? b.color : "var(--text-dim)" }}>
-                        <span className="text-[var(--orange)] glow-text">{b.label}</span>{" "}
-                        {b.hint}
-                      </span>
                     </button>);
                 })}
               </div>}
 
+              {mode === "HELIO" && helioLayerHint &&
+              <div className="pointer-events-none absolute bottom-8 left-2 z-30 max-w-[min(560px,72vw)] border border-[var(--line)] bg-[rgba(5,4,10,0.62)] px-2 py-1 text-[10px] leading-tight text-[var(--green)] backdrop-blur-sm">
+                ▸ {helioLayerHint}
+              </div>}
+
               {/* nearest approach panel — desktop only, overlays the map top-left */}
-              {nextApproach &&
+              {mode !== "VEHICLES" && nextApproach &&
               <button
                 type="button"
                 data-sfx="select"
@@ -449,6 +706,7 @@ export function App() {
               }
 
               {/* title + source — top right of the main map */}
+              {mode !== "VEHICLES" &&
               <div className="pointer-events-none absolute right-2 top-2 z-20 flex max-w-[46vw] flex-col items-end text-right">
                 <div className="hud-title text-[var(--amber-bright)] glow-text">
                   <em>SENTRY:</em> NEAR EARTH<br />OBJECT ENCOUNTERS
@@ -489,13 +747,18 @@ export function App() {
                     {sfxReady ? soundOn ? "AUDIO ON" : "AUDIO OFF" : "AUDIO · SYNTH…"}
                   </button>
                 </div>
-              </div>
+              </div>}
 
               {/* detail overlay */}
-              {selected &&
-              <div className="absolute right-2 bottom-2 z-20">
+              {mode !== "VEHICLES" && selected &&
+              <>
+                <div className="fixed inset-2 z-50 flex items-center justify-center bg-[rgba(5,4,10,0.45)] p-2 backdrop-blur-[2px] md:hidden">
+                  <DetailPanel obj={selected} sbdb={sbdb} sbdbLoading={sbdbLoading} scrubberMs={scrubberMs} onClose={() => setSelected(null)} modal />
+                </div>
+                <div className="absolute right-2 bottom-2 z-20 hidden md:block">
                   <DetailPanel obj={selected} sbdb={sbdb} sbdbLoading={sbdbLoading} scrubberMs={scrubberMs} onClose={() => setSelected(null)} />
                 </div>
+              </>
               }
             </div>
             {/* scrubber */}
@@ -517,34 +780,72 @@ export function App() {
           </section>
         </div>
 
-        {/* right rail — NASA DONKI space-weather console (heliocentric context) */}
-        <section className="area-sw-cme relative flex min-h-0 flex-col overflow-hidden border-l border-b border-[var(--line)] p-2">
-          <Plus at="tl" /><Plus at="bl" />
-          {sw ?
-          <SolarWindMap cmes={sw.cmes} kp={sw.kp} nowMs={scrubberMs} /> :
-          <SwStandby />}
-        </section>
-        <section className="area-sw-flare relative flex min-h-0 flex-col overflow-hidden border-l border-b border-[var(--line)] p-2">
-          <Plus at="bl" />
-          {sw ?
-          <FlareTimeline flares={sw.flares} windowMin={sw.windowMin} nowMs={nowMs} scrubberMs={scrubberMs} /> :
-          <SwStandby />}
-        </section>
-        <section className="area-sw-kp relative flex min-h-0 flex-col overflow-hidden border-l border-[var(--line)] p-2">
-          {sw ?
-          <KpGauge kp={sw.kp} nowMs={scrubberMs} /> :
-          <SwStandby />}
-        </section>
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize side panel column"
+          aria-orientation="vertical"
+          aria-valuemin={resizeA11y.desktopLeft.min}
+          aria-valuemax={resizeA11y.desktopLeft.max}
+          aria-valuenow={resizeA11y.desktopLeft.now}
+          aria-valuetext={resizeA11y.desktopLeft.text}
+          className="resize-handle resize-handle-v hidden md:block"
+          style={{ gridColumn: "1 / 2", gridRow: "1 / -1", justifySelf: "end" }}
+          onKeyDown={resizeWithKeyboard("desktop-left")}
+          onPointerDown={beginResize("desktop-left")} />
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize mini map panel"
+          aria-orientation="horizontal"
+          aria-valuemin={resizeA11y.desktopMini.min}
+          aria-valuemax={resizeA11y.desktopMini.max}
+          aria-valuenow={resizeA11y.desktopMini.now}
+          aria-valuetext={resizeA11y.desktopMini.text}
+          className="resize-handle resize-handle-h hidden md:block"
+          style={{ gridColumn: "1 / 2", gridRow: "1 / 2", alignSelf: "end" }}
+          onKeyDown={resizeWithKeyboard("desktop-mini")}
+          onPointerDown={beginResize("desktop-mini")} />
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize craft panel"
+          aria-orientation="horizontal"
+          aria-valuemin={resizeA11y.desktopRadar.min}
+          aria-valuemax={resizeA11y.desktopRadar.max}
+          aria-valuenow={resizeA11y.desktopRadar.now}
+          aria-valuetext={resizeA11y.desktopRadar.text}
+          className="resize-handle resize-handle-h hidden md:block"
+          style={{ gridColumn: "1 / 2", gridRow: "2 / 3", alignSelf: "end" }}
+          onKeyDown={resizeWithKeyboard("desktop-radar")}
+          onPointerDown={beginResize("desktop-radar")} />
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize main map height"
+          aria-orientation="horizontal"
+          aria-valuemin={resizeA11y.mobileMain.min}
+          aria-valuemax={resizeA11y.mobileMain.max}
+          aria-valuenow={resizeA11y.mobileMain.now}
+          aria-valuetext={resizeA11y.mobileMain.text}
+          className="resize-handle resize-handle-h md:hidden"
+          style={{ gridColumn: "1 / -1", gridRow: "1 / 2", alignSelf: "end" }}
+          onKeyDown={resizeWithKeyboard("mobile-main")}
+          onPointerDown={beginResize("mobile-main")} />
+        <div
+          role="separator"
+          tabIndex={0}
+          aria-label="Resize mobile side column"
+          aria-orientation="vertical"
+          aria-valuemin={resizeA11y.mobileLeft.min}
+          aria-valuemax={resizeA11y.mobileLeft.max}
+          aria-valuenow={resizeA11y.mobileLeft.now}
+          aria-valuetext={resizeA11y.mobileLeft.text}
+          className="resize-handle resize-handle-v md:hidden"
+          style={{ gridColumn: "1 / 2", gridRow: "2 / -1", justifySelf: "end" }}
+          onKeyDown={resizeWithKeyboard("mobile-left")}
+          onPointerDown={beginResize("mobile-left")} />
       </div>
-    </div>);
-
-}
-
-// Placeholder shown in the space-weather column until the DONKI uplink resolves.
-function SwStandby() {
-  return (
-    <div className="flex h-full items-center justify-center text-[11px] text-[var(--amber-dim)]">
-      ▸ DONKI UPLINK…
     </div>);
 
 }
