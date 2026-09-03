@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-server
+.cache
+.vercel
+.claude/
+.DS_Store
+.env*
