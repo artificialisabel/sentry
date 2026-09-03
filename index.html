@@ -71,10 +71,11 @@
   .font-display { font-family: var(--font-display); }
   .clock-font { font-family: 'Share Tech Mono', ui-monospace, monospace; }
   .elong { font-family: var(--font-display); transform: scaleX(0.66); transform-origin: left center; display: inline-block; letter-spacing: 0.02em; font-weight: 700; }
-  .hud-title { font-family: var(--font-display); transform: scaleX(0.66); transform-origin: right center;
+  .hud-title { font-family: 'Imbue', ui-serif, Georgia, serif; font-style: normal; font-synthesis: style;
+      transform: scaleX(0.66); transform-origin: right center;
       display: inline-block; letter-spacing: 0.02em; font-weight: 700;
       font-size: clamp(38px, 5vw, 66px); line-height: 0.88; }
-  .hud-title em { font-style: italic; }
+  .hud-title > em { font-style: oblique 12deg; }
   @media (max-width: 767px) {
     .hud-title { font-size: 3.9vw; line-height: 0.92; }
   }

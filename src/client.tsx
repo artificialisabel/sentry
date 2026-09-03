@@ -1,5 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import "@fontsource/imbue/latin-700.css";
 import { App } from "./components/App";
 import "./tailwind.css";
 
